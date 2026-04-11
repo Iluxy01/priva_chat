@@ -2,19 +2,30 @@ import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'core/theme/app_theme.dart';
 import 'core/services/auth_service.dart';
+import 'core/services/websocket_service.dart';
+import 'core/services/presence_service.dart';
 import 'core/database/app_database.dart';
 import 'core/services/local_storage_service.dart';
 import 'features/auth/screens/login_screen.dart';
 import 'features/auth/screens/register_screen.dart';
 import 'features/chats/screens/chats_list_screen.dart';
+import 'features/chats/screens/chat_screen.dart';
 import 'features/profile/screens/profile_screen.dart';
+import 'features/search/screens/user_search_screen.dart';
+import 'package:timeago/timeago.dart' as timeago;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Инициализируем локальную БД
+  // Регистрируем русскую локаль для timeago (дата последнего сообщения)
+  timeago.setLocaleMessages('ru', timeago.RuMessages());
+
   final db = AppDatabase();
   LocalStorageService.instance.init(db);
+  PresenceService.instance.init();
+
+  final loggedIn = await AuthService.isLoggedIn();
+  if (loggedIn) WebSocketService.instance.connect();
 
   runApp(const PrivaChatApp());
 }
@@ -25,7 +36,11 @@ final _router = GoRouter(
     final loggedIn = await AuthService.isLoggedIn();
     final onAuth = state.matchedLocation == '/login' ||
         state.matchedLocation == '/register';
-    if (loggedIn && onAuth) return '/chats';
+
+    if (loggedIn && onAuth) {
+      WebSocketService.instance.connect();
+      return '/chats';
+    }
     if (!loggedIn && !onAuth) return '/login';
     return null;
   },
@@ -34,11 +49,53 @@ final _router = GoRouter(
     GoRoute(path: '/register', builder: (_, __) => const RegisterScreen()),
     GoRoute(path: '/chats',    builder: (_, __) => const ChatsListScreen()),
     GoRoute(path: '/profile',  builder: (_, __) => const ProfileScreen()),
+    GoRoute(path: '/search',   builder: (_, __) => const UserSearchScreen()),
+    GoRoute(
+      path: '/chat/:id',
+      builder: (_, state) => ChatScreen(
+        chatId: int.parse(state.pathParameters['id']!),
+      ),
+    ),
   ],
 );
 
-class PrivaChatApp extends StatelessWidget {
+class PrivaChatApp extends StatefulWidget {
   const PrivaChatApp({super.key});
+
+  @override
+  State<PrivaChatApp> createState() => _PrivaChatAppState();
+}
+
+class _PrivaChatAppState extends State<PrivaChatApp>
+    with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) async {
+    switch (state) {
+      case AppLifecycleState.resumed:
+        final loggedIn = await AuthService.isLoggedIn();
+        if (loggedIn) WebSocketService.instance.connect();
+        break;
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        WebSocketService.instance.disconnect();
+        break;
+      default:
+        break;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp.router(

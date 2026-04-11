@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import '../../../core/services/auth_service.dart';
 import '../../../core/theme/app_theme.dart';
+import '../../../core/services/websocket_service.dart';
 
 class RegisterScreen extends StatefulWidget {
   const RegisterScreen({super.key});
@@ -65,6 +66,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
 
       if (result['success']) {
         context.go('/chats');
+        WebSocketService.instance.connect();
       } else {
         setState(() => _error = result['error']);
       }
