@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import '../../../core/constants/app_constants.dart';
@@ -18,22 +19,29 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  final _textCtrl  = TextEditingController();
+  final _textCtrl   = TextEditingController();
   final _scrollCtrl = ScrollController();
-  final _uuid      = const Uuid();
+  final _uuid       = const Uuid();
 
-  int _myUserId  = 0;
-  int? _peerId;
-  String _peerName = '';
+  int    _myUserId = 0;
+  Chat?  _chat;
+
+  // Direct: единственный собеседник
+  int?     _peerId;
   Contact? _peerContact;
-  Chat? _chat;
 
-  bool _isTyping = false;         // собеседник печатает
-  Timer? _typingTimer;            // сбрасывает индикатор через 3с
-  Timer? _myTypingTimer;          // debounce нашего typing event
+  // Group: все участники кроме себя (для relay)
+  List<int> _memberIds = [];
+
+  bool _isTyping = false;
+  Timer? _typingTimer;
+  Timer? _myTypingTimer;
   bool _sending = false;
 
   final List<StreamSubscription> _subs = [];
+
+  // Кэш имён отправителей для группы
+  final Map<int, String> _senderNames = {};
 
   @override
   void initState() {
@@ -46,93 +54,93 @@ class _ChatScreenState extends State<ChatScreen> {
     _myUserId = prefs.getInt(AppConstants.userIdKey) ?? 0;
 
     _chat = await LocalStorageService.instance.getChat(widget.chatId);
-    if (_chat != null && _chat!.peerId != null) {
+
+    if (_chat?.type == 'direct' && _chat?.peerId != null) {
       _peerId = _chat!.peerId;
       _peerContact = await LocalStorageService.instance.getContact(_peerId!);
-      _peerName = _peerContact?.displayName ?? _peerContact?.username ?? 'Пользователь';
+    }
+
+    // Загружаем всех участников (и для direct, и для group)
+    final members = await LocalStorageService.instance.getChatMembers(widget.chatId);
+    _memberIds = members
+        .map((m) => m.userId)
+        .where((id) => id != _myUserId)
+        .toList();
+
+    // Кэш имён для группы
+    for (final m in members) {
+      if (m.userId == _myUserId) continue;
+      final c = await LocalStorageService.instance.getContact(m.userId);
+      if (c != null) _senderNames[m.userId] = c.displayName;
     }
 
     if (mounted) setState(() {});
 
-    // Очистить непрочитанные
     await LocalStorageService.instance.clearUnread(widget.chatId);
-
     _subscribeWs();
   }
 
   void _subscribeWs() {
     final ws = WebSocketService.instance;
 
-    // Входящие сообщения
     _subs.add(ws.onMessage.listen((msg) {
       if (msg.chatId != widget.chatId) return;
       _handleIncoming(msg);
     }));
 
-    // Индикатор печати
     _subs.add(ws.onTyping.listen((t) {
       if (t.chatId != widget.chatId || t.senderId == _myUserId) return;
       _typingTimer?.cancel();
       if (!mounted) return;
       setState(() => _isTyping = t.isTyping);
       if (t.isTyping) {
-        _typingTimer = Timer(const Duration(seconds: 3), () {
-          if (mounted) setState(() => _isTyping = false);
-        });
+        _typingTimer = Timer(const Duration(seconds: 3),
+            () { if (mounted) setState(() => _isTyping = false); });
       }
     }));
 
-    // Статус "прочитано"
     _subs.add(ws.onRead.listen((r) {
       if (r.chatId != widget.chatId) return;
-      // В Шаге 8 обновим статус сообщений; здесь просто логируем
+      // TODO: обновить статус read в Шаге 8
     }));
   }
 
   Future<void> _handleIncoming(WsMessage msg) async {
-    // На данном этапе (до Шага 8) сохраняем encrypted_content как plaintext.
-    // После добавления E2E (Шаг 8) здесь будет расшифровка.
     await LocalStorageService.instance.saveMessage(
       id:        msg.tempId ?? _uuid.v4(),
       chatId:    msg.chatId,
       senderId:  msg.senderId,
-      content:   msg.encryptedContent, // TODO: decrypt in Step 8
+      content:   msg.encryptedContent, // TODO: decrypt Step 8
       mediaType: msg.mediaType,
       sentAt:    msg.sentAt,
       status:    'delivered',
       isMe:      false,
     );
-
     await LocalStorageService.instance.updateLastMessage(
-      msg.chatId,
-      msg.encryptedContent,
-      msg.sentAt,
-    );
+        msg.chatId, msg.encryptedContent, msg.sentAt);
 
-    // Отправить read-receipt
-    if (_peerId != null) {
+    // read receipt только для direct
+    if (_chat?.type == 'direct') {
       WebSocketService.instance.sendRead(
-        chatId:     widget.chatId,
-        senderId:   msg.senderId,
+        chatId:    widget.chatId,
+        senderId:  msg.senderId,
         upToTempId: msg.tempId,
       );
     }
-
     _scrollToBottom();
   }
 
   Future<void> _send() async {
     final text = _textCtrl.text.trim();
-    if (text.isEmpty || _sending || _peerId == null) return;
+    if (text.isEmpty || _sending || _memberIds.isEmpty) return;
 
     setState(() => _sending = true);
     _textCtrl.clear();
     _stopMyTyping();
 
-    final tempId  = _uuid.v4();
-    final sentAt  = DateTime.now().toUtc().toIso8601String();
+    final tempId = _uuid.v4();
+    final sentAt = DateTime.now().toUtc().toIso8601String();
 
-    // Сохраняем локально сразу (optimistic)
     await LocalStorageService.instance.saveMessage(
       id:       tempId,
       chatId:   widget.chatId,
@@ -142,61 +150,49 @@ class _ChatScreenState extends State<ChatScreen> {
       status:   'sending',
       isMe:     true,
     );
-
     await LocalStorageService.instance.updateLastMessage(
-      widget.chatId, text, sentAt,
-    );
+        widget.chatId, text, sentAt);
 
     _scrollToBottom();
 
-    // TODO (Шаг 8): зашифровать text перед отправкой
+    // TODO (Шаг 8): зашифровать text
     final sent = WebSocketService.instance.sendMessage(
       chatId:           widget.chatId,
       tempId:           tempId,
-      encryptedContent: text, // TODO: encrypt in Step 8
-      recipientIds:     [_peerId!],
+      encryptedContent: text,
+      recipientIds:     _memberIds, // для групп — все участники
     );
 
-    if (!sent) {
-      // WS не подключён — помечаем 'sending', доставим при reconnect (Шаг 9)
-      debugPrint('[Chat] WS offline — message queued locally');
-    }
+    if (!sent) debugPrint('[Chat] WS offline — message queued locally');
 
-    // Слушаем ACK, чтобы обновить статус
     late StreamSubscription ackSub;
     ackSub = WebSocketService.instance.onAck.listen((ack) async {
       if (ack.tempId != tempId) return;
       await LocalStorageService.instance.updateMessageStatus(
-        tempId,
-        ack.delivered ? 'delivered' : 'sent',
-      );
+          tempId, ack.delivered ? 'delivered' : 'sent');
       ackSub.cancel();
     });
 
     if (mounted) setState(() => _sending = false);
   }
 
-  // ── Typing indicator ────────────────────────────────────────────────────────
-
   void _onTextChanged(String _) {
-    if (_peerId == null) return;
+    if (_memberIds.isEmpty) return;
     _myTypingTimer?.cancel();
-
     WebSocketService.instance.sendTyping(
       chatId:       widget.chatId,
-      recipientIds: [_peerId!],
+      recipientIds: _memberIds,
       isTyping:     true,
     );
-
     _myTypingTimer = Timer(const Duration(seconds: 2), _stopMyTyping);
   }
 
   void _stopMyTyping() {
     _myTypingTimer?.cancel();
-    if (_peerId == null) return;
+    if (_memberIds.isEmpty) return;
     WebSocketService.instance.sendTyping(
       chatId:       widget.chatId,
-      recipientIds: [_peerId!],
+      recipientIds: _memberIds,
       isTyping:     false,
     );
   }
@@ -224,6 +220,8 @@ class _ChatScreenState extends State<ChatScreen> {
     super.dispose();
   }
 
+  // ── Build ──────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -240,25 +238,50 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   PreferredSizeWidget _buildAppBar() {
+    final isGroup = _chat?.type == 'group';
+    final name = isGroup
+        ? (_chat?.name ?? 'Группа')
+        : (_peerContact?.displayName ?? 'Пользователь');
+    final avatarUrl = isGroup ? _chat?.avatarUrl : _peerContact?.avatarUrl;
+
     return AppBar(
       titleSpacing: 0,
-      title: Row(
-        children: [
-          _SmallAvatar(name: _peerName, url: _peerContact?.avatarUrl),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(_peerName,
-                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                if (_peerId != null)
-                  OnlineStatusText(userId: _peerId!, style: const TextStyle(fontSize: 12)),
-              ],
+      title: GestureDetector(
+        onTap: isGroup
+            ? () => context.push('/group-info/${widget.chatId}')
+            : null,
+        child: Row(
+          children: [
+            _AppBarAvatar(
+                name: name, url: avatarUrl, isGroup: isGroup),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(name,
+                      style: const TextStyle(
+                          fontSize: 16, fontWeight: FontWeight.bold)),
+                  if (!isGroup && _peerId != null)
+                    OnlineStatusText(userId: _peerId!,
+                        style: const TextStyle(fontSize: 12))
+                  else if (isGroup)
+                    Text('${_memberIds.length + 1} участников',
+                        style: const TextStyle(
+                            fontSize: 12, color: Colors.grey)),
+                ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
+      actions: [
+        if (isGroup)
+          IconButton(
+            icon: const Icon(Icons.info_outline),
+            onPressed: () => context.push('/group-info/${widget.chatId}'),
+          ),
+      ],
     );
   }
 
@@ -267,15 +290,14 @@ class _ChatScreenState extends State<ChatScreen> {
       stream: LocalStorageService.instance.watchMessages(widget.chatId),
       builder: (context, snap) {
         final msgs = snap.data ?? [];
-
         if (msgs.isEmpty) {
           return const Center(
             child: Text('Напиши первое сообщение 👋',
                 style: TextStyle(color: Colors.grey)),
           );
         }
-
-        WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+        WidgetsBinding.instance
+            .addPostFrameCallback((_) => _scrollToBottom());
 
         return ListView.builder(
           controller: _scrollCtrl,
@@ -284,13 +306,20 @@ class _ChatScreenState extends State<ChatScreen> {
           itemBuilder: (context, i) {
             final msg = msgs[i];
             final showDate = i == 0 ||
-                !_sameDay(
-                    DateTime.parse(msgs[i - 1].sentAt),
+                !_sameDay(DateTime.parse(msgs[i - 1].sentAt),
                     DateTime.parse(msg.sentAt));
+            // Показываем имя отправителя в группах
+            final showSender = _chat?.type == 'group' && !msg.isMe;
             return Column(
               children: [
                 if (showDate) _DateDivider(iso: msg.sentAt),
-                MessageBubble(message: msg, myUserId: _myUserId),
+                MessageBubble(
+                  message:    msg,
+                  myUserId:   _myUserId,
+                  senderName: showSender
+                      ? (_senderNames[msg.senderId] ?? 'Участник')
+                      : null,
+                ),
               ],
             );
           },
@@ -300,24 +329,21 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Widget _buildTypingIndicator() {
+    final name = _chat?.type == 'group' ? 'Участник' : (_peerContact?.displayName ?? '');
     return Padding(
       padding: const EdgeInsets.only(left: 16, bottom: 4),
-      child: Row(
-        children: [
-          Text(_peerName, style: const TextStyle(fontSize: 12, color: Colors.grey)),
-          const SizedBox(width: 4),
-          const Text('печатает...', style: TextStyle(fontSize: 12, color: Colors.grey)),
-          const SizedBox(width: 6),
-          const _TypingDots(),
-        ],
-      ),
+      child: Row(children: [
+        Text(name, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+        const SizedBox(width: 4),
+        const Text('печатает...', style: TextStyle(fontSize: 12, color: Colors.grey)),
+        const SizedBox(width: 6),
+        const _TypingDots(),
+      ]),
     );
   }
 
   Widget _buildInput() {
-    final theme = Theme.of(context);
-    final isDark = theme.brightness == Brightness.dark;
-
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     return SafeArea(
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
@@ -326,15 +352,16 @@ class _ChatScreenState extends State<ChatScreen> {
             Expanded(
               child: Container(
                 decoration: BoxDecoration(
-                  color: isDark ? const Color(0xFF252525) : const Color(0xFFF0F0F0),
+                  color: isDark
+                      ? const Color(0xFF252525) : const Color(0xFFF0F0F0),
                   borderRadius: BorderRadius.circular(24),
                 ),
                 child: TextField(
-                  controller: _textCtrl,
-                  onChanged: _onTextChanged,
-                  onSubmitted: (_) => _send(),
-                  maxLines: null,
-                  textInputAction: TextInputAction.send,
+                  controller:       _textCtrl,
+                  onChanged:        _onTextChanged,
+                  onSubmitted:      (_) => _send(),
+                  maxLines:         null,
+                  textInputAction:  TextInputAction.send,
                   decoration: const InputDecoration(
                     hintText: 'Сообщение...',
                     border: InputBorder.none,
@@ -345,20 +372,15 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ),
             const SizedBox(width: 6),
-            AnimatedContainer(
-              duration: const Duration(milliseconds: 200),
-              child: FloatingActionButton.small(
-                onPressed: _sending ? null : _send,
-                elevation: 1,
-                child: _sending
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 2, color: Colors.white),
-                      )
-                    : const Icon(Icons.send_rounded),
-              ),
+            FloatingActionButton.small(
+              onPressed: _sending ? null : _send,
+              elevation: 1,
+              child: _sending
+                  ? const SizedBox(
+                      width: 18, height: 18,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: Colors.white))
+                  : const Icon(Icons.send_rounded),
             ),
           ],
         ),
@@ -372,18 +394,41 @@ class _ChatScreenState extends State<ChatScreen> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+class _AppBarAvatar extends StatelessWidget {
+  final String name;
+  final String? url;
+  final bool isGroup;
+  const _AppBarAvatar({required this.name, this.url, required this.isGroup});
+
+  @override
+  Widget build(BuildContext context) {
+    return CircleAvatar(
+      radius: 18,
+      backgroundColor: const Color(0xFF6C63FF),
+      backgroundImage: url != null ? NetworkImage(url!) : null,
+      child: url == null
+          ? (isGroup
+              ? const Icon(Icons.group, color: Colors.white, size: 18)
+              : Text(name.isNotEmpty ? name[0].toUpperCase() : '?',
+                  style: const TextStyle(
+                      color: Colors.white, fontWeight: FontWeight.bold)))
+          : null,
+    );
+  }
+}
+
 class _DateDivider extends StatelessWidget {
   final String iso;
   const _DateDivider({required this.iso});
 
   @override
   Widget build(BuildContext context) {
-    final dt = DateTime.parse(iso).toLocal();
+    final dt  = DateTime.parse(iso).toLocal();
     final now = DateTime.now();
-    String label;
-    if (now.difference(dt).inDays == 0)       label = 'Сегодня';
-    else if (now.difference(dt).inDays == 1)  label = 'Вчера';
-    else                                       label = '${dt.day}.${dt.month.toString().padLeft(2,'0')}.${dt.year}';
+    final String label;
+    if (now.difference(dt).inDays == 0)      label = 'Сегодня';
+    else if (now.difference(dt).inDays == 1) label = 'Вчера';
+    else label = '${dt.day}.${dt.month.toString().padLeft(2,'0')}.${dt.year}';
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 12),
@@ -396,25 +441,6 @@ class _DateDivider extends StatelessWidget {
         ),
         const Expanded(child: Divider()),
       ]),
-    );
-  }
-}
-
-class _SmallAvatar extends StatelessWidget {
-  final String name;
-  final String? url;
-  const _SmallAvatar({required this.name, this.url});
-
-  @override
-  Widget build(BuildContext context) {
-    return CircleAvatar(
-      radius: 18,
-      backgroundColor: const Color(0xFF6C63FF),
-      backgroundImage: url != null ? NetworkImage(url!) : null,
-      child: url == null
-          ? Text(name.isNotEmpty ? name[0].toUpperCase() : '?',
-              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))
-          : null,
     );
   }
 }
@@ -439,32 +465,21 @@ class _TypingDotsState extends State<_TypingDots>
   }
 
   @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
+  void dispose() { _ctrl.dispose(); super.dispose(); }
 
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: _ctrl,
-      builder: (_, __) {
-        return Row(
-          children: List.generate(3, (i) {
-            final opacity = (((_ctrl.value * 3 - i) % 3 + 3) % 3 < 1)
-                ? 1.0
-                : 0.3;
-            return Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 1),
-              child: Opacity(
-                opacity: opacity,
-                child: const CircleAvatar(
-                    radius: 3, backgroundColor: Colors.grey),
-              ),
-            );
-          }),
-        );
-      },
+      builder: (_, __) => Row(
+        children: List.generate(3, (i) => Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 1),
+          child: Opacity(
+            opacity: (((_ctrl.value * 3 - i) % 3 + 3) % 3 < 1) ? 1.0 : 0.3,
+            child: const CircleAvatar(radius: 3, backgroundColor: Colors.grey),
+          ),
+        )),
+      ),
     );
   }
 }
