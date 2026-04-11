@@ -2,12 +2,17 @@ import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'core/theme/app_theme.dart';
 import 'core/services/auth_service.dart';
+import 'core/services/presence_service.dart';
 import 'core/database/app_database.dart';
 import 'core/services/local_storage_service.dart';
 import 'features/auth/screens/login_screen.dart';
 import 'features/auth/screens/register_screen.dart';
 import 'features/chats/screens/chats_list_screen.dart';
+import 'features/chats/screens/chat_screen.dart';
+import 'features/chats/screens/create_group_screen.dart';
+import 'features/chats/screens/group_info_screen.dart';
 import 'features/profile/screens/profile_screen.dart';
+import 'features/search/screens/user_search_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -15,6 +20,9 @@ void main() async {
   // Инициализируем локальную БД
   final db = AppDatabase();
   LocalStorageService.instance.init(db);
+
+  // Инициализируем сервис присутствия
+  PresenceService.instance.init();
 
   runApp(const PrivaChatApp());
 }
@@ -34,6 +42,18 @@ final _router = GoRouter(
     GoRoute(path: '/register', builder: (_, __) => const RegisterScreen()),
     GoRoute(path: '/chats',    builder: (_, __) => const ChatsListScreen()),
     GoRoute(path: '/profile',  builder: (_, __) => const ProfileScreen()),
+    GoRoute(path: '/search',   builder: (_, __) => const UserSearchScreen()),
+    GoRoute(path: '/create-group', builder: (_, __) => const CreateGroupScreen()),
+    GoRoute(
+      path: '/chat/:id',
+      builder: (_, state) =>
+          ChatScreen(chatId: int.parse(state.pathParameters['id']!)),
+    ),
+    GoRoute(
+      path: '/group-info/:id',
+      builder: (_, state) =>
+          GroupInfoScreen(chatId: int.parse(state.pathParameters['id']!)),
+    ),
   ],
 );
 

@@ -8,6 +8,9 @@ import '../../../core/services/chat_service.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../auth/models/user_model.dart';
 
+// Ключ для хранения удалённых чатов (совпадает с ChatsListScreen и ChatScreen)
+const _deletedChatsKeyGroup = 'deleted_chat_ids';
+
 class GroupInfoScreen extends StatefulWidget {
   final int chatId;
   const GroupInfoScreen({super.key, required this.chatId});
@@ -64,6 +67,45 @@ class _GroupInfoScreenState extends State<GroupInfoScreen> {
     });
   }
 
+  Future<void> _deleteOrLeave() async {
+    final action = _amAdmin ? 'Удалить группу' : 'Покинуть группу';
+    final body = _amAdmin
+        ? 'Группа будет удалена для всех участников. Сообщения на устройствах участников останутся.'
+        : 'Ты покинешь группу. Твои сообщения на твоём устройстве останутся.';
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text(action),
+        content: Text(body),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          TextButton(
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            onPressed: () => Navigator.pop(context, true),
+            child: Text(action),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    // FIX: запоминаем что удалили — чтобы не восстановилось при следующей синхронизации
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getStringList(_deletedChatsKeyGroup) ?? [];
+    if (!raw.contains(widget.chatId.toString())) {
+      raw.add(widget.chatId.toString());
+      await prefs.setStringList(_deletedChatsKeyGroup, raw);
+    }
+
+    await ChatService.deleteChat(widget.chatId);
+    await LocalStorageService.instance.deleteChatFull(widget.chatId);
+    if (mounted) context.go('/chats');
+  }
+
   Future<void> _addMember(UserModel user) async {
     try {
       await ChatService.addMemberToGroup(widget.chatId, user.id);
@@ -91,7 +133,43 @@ class _GroupInfoScreenState extends State<GroupInfoScreen> {
     final name = _chat?.name ?? 'Группа';
 
     return Scaffold(
-      appBar: AppBar(title: Text(name)),
+      appBar: AppBar(
+        // FIX: явная кнопка назад
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () {
+            if (context.canPop()) {
+              context.pop();
+            } else {
+              context.go('/chats');
+            }
+          },
+        ),
+        title: Text(name),
+        actions: [
+          PopupMenuButton<String>(
+            onSelected: (v) {
+              if (v == 'delete') _deleteOrLeave();
+            },
+            itemBuilder: (_) => [
+              PopupMenuItem(
+                value: 'delete',
+                child: Row(children: [
+                  Icon(
+                    _amAdmin ? Icons.delete_outline : Icons.exit_to_app,
+                    color: Colors.red,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    _amAdmin ? 'Удалить группу' : 'Покинуть группу',
+                    style: const TextStyle(color: Colors.red),
+                  ),
+                ]),
+              ),
+            ],
+          ),
+        ],
+      ),
       body: ListView(
         children: [
           // Шапка группы

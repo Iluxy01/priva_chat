@@ -118,4 +118,6 @@ class LocalStorageService {
 
   Future<void> deleteAllChatMessages(int chatId) =>
       _db.deleteAllChatMessages(chatId);
+
+  Future<void> deleteChatFull(int chatId) => _db.deleteChatFull(chatId);
 }

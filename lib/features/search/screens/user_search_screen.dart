@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/services/chat_service.dart';
 import '../../../core/services/local_storage_service.dart';
 import '../../../core/theme/app_theme.dart';
@@ -90,12 +91,21 @@ class _UserSearchScreenState extends State<UserSearchScreen> {
         return;
       }
 
+      // Сохраняем чат локально
       await LocalStorageService.instance.saveChat(
         id:     chatId,
         type:   'direct',
         peerId: user.id,
       );
+      // Сохраняем обоих участников — собеседника и себя
+      // (myUserId нужен чтобы _memberIds в ChatScreen не был пустым)
       await LocalStorageService.instance.saveMember(chatId, user.id);
+      // Получаем своё id из SharedPreferences
+      final prefs = await SharedPreferences.getInstance();
+      final myId = prefs.getInt('user_id') ?? 0;
+      if (myId != 0) {
+        await LocalStorageService.instance.saveMember(chatId, myId);
+      }
 
       if (!mounted) return;
       context.go('/chat/$chatId');

@@ -322,10 +322,7 @@ class WebSocketService extends ChangeNotifier {
 
     // Экспоненциальная задержка: 1s, 2s, 4s, 8s, 16s, 32s, 60s (максимум)
     final delay = Duration(
-      seconds: (_maxReconnectDelay.inSeconds).clamp(
-        1,
-        (1 << _reconnectAttempts.clamp(0, 6)),
-      ),
+      seconds: (1 << _reconnectAttempts.clamp(0, 6)).clamp(1, 60),
     );
 
     _reconnectAttempts++;

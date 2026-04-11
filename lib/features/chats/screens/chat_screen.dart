@@ -5,10 +5,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import '../../../core/constants/app_constants.dart';
 import '../../../core/database/app_database.dart';
+import '../../../core/services/chat_service.dart';
 import '../../../core/services/local_storage_service.dart';
 import '../../../core/services/websocket_service.dart';
 import '../../../core/widgets/connection_status_bar.dart';
 import '../widgets/message_bubble.dart';
+
+// Ключ для хранения удалённых чатов (должен совпадать с ChatsListScreen)
+const _deletedChatsKey = 'deleted_chat_ids';
 
 class ChatScreen extends StatefulWidget {
   final int chatId;
@@ -26,21 +30,18 @@ class _ChatScreenState extends State<ChatScreen> {
   int    _myUserId = 0;
   Chat?  _chat;
 
-  // Direct: единственный собеседник
   int?     _peerId;
   Contact? _peerContact;
 
-  // Group: все участники кроме себя (для relay)
   List<int> _memberIds = [];
 
   bool _isTyping = false;
   Timer? _typingTimer;
   Timer? _myTypingTimer;
   bool _sending = false;
+  bool _loadingMembers = true;
 
   final List<StreamSubscription> _subs = [];
-
-  // Кэш имён отправителей для группы
   final Map<int, String> _senderNames = {};
 
   @override
@@ -60,24 +61,52 @@ class _ChatScreenState extends State<ChatScreen> {
       _peerContact = await LocalStorageService.instance.getContact(_peerId!);
     }
 
-    // Загружаем всех участников (и для direct, и для group)
+    await _loadMembers();
+
+    if (_memberIds.isEmpty) {
+      await _fetchMembersFromServer();
+    }
+
+    if (mounted) setState(() => _loadingMembers = false);
+    await LocalStorageService.instance.clearUnread(widget.chatId);
+    _subscribeWs();
+  }
+
+  Future<void> _loadMembers() async {
     final members = await LocalStorageService.instance.getChatMembers(widget.chatId);
     _memberIds = members
         .map((m) => m.userId)
         .where((id) => id != _myUserId)
         .toList();
 
-    // Кэш имён для группы
     for (final m in members) {
       if (m.userId == _myUserId) continue;
       final c = await LocalStorageService.instance.getContact(m.userId);
       if (c != null) _senderNames[m.userId] = c.displayName;
     }
+  }
 
-    if (mounted) setState(() {});
-
-    await LocalStorageService.instance.clearUnread(widget.chatId);
-    _subscribeWs();
+  Future<void> _fetchMembersFromServer() async {
+    try {
+      final serverMembers = await ChatService.getChatMembers(widget.chatId);
+      for (final u in serverMembers) {
+        await LocalStorageService.instance.saveContact(
+          id: u.id,
+          username: u.username,
+          displayName: u.displayName,
+          avatarUrl: u.avatarUrl,
+          publicKey: u.publicKey,
+          lastSeen: u.lastSeen,
+        );
+        await LocalStorageService.instance.saveMember(widget.chatId, u.id);
+        if (u.id != _myUserId) {
+          _senderNames[u.id] = u.displayName;
+        }
+      }
+      await _loadMembers();
+    } catch (e) {
+      debugPrint('[ChatScreen] fetchMembers error: $e');
+    }
   }
 
   void _subscribeWs() {
@@ -85,6 +114,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
     _subs.add(ws.onMessage.listen((msg) {
       if (msg.chatId != widget.chatId) return;
+      // FIX: ChatsListScreen уже сохраняет сообщение глобально.
+      // Здесь нам нужно только обновить UI (сenderNames, scroll, read receipt).
+      // Но на случай если ChatsListScreen ещё не успел — дёргаем saveMessage тоже
+      // (insertOnConflictUpdate — дублей не будет).
       _handleIncoming(msg);
     }));
 
@@ -94,23 +127,32 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted) return;
       setState(() => _isTyping = t.isTyping);
       if (t.isTyping) {
-        _typingTimer = Timer(const Duration(seconds: 3),
+        _typingTimer = Timer(
+            const Duration(seconds: 3),
             () { if (mounted) setState(() => _isTyping = false); });
+      }
+    }));
+
+    _subs.add(ws.onAck.listen((ack) async {
+      if (ack.chatId != widget.chatId) return;
+      if (ack.tempId != null) {
+        await LocalStorageService.instance.updateMessageStatus(
+            ack.tempId!, ack.delivered ? 'delivered' : 'sent');
       }
     }));
 
     _subs.add(ws.onRead.listen((r) {
       if (r.chatId != widget.chatId) return;
-      // TODO: обновить статус read в Шаге 8
     }));
   }
 
   Future<void> _handleIncoming(WsMessage msg) async {
+    // Сохраняем — insertOnConflictUpdate, дублей нет даже если ChatsListScreen уже сохранил
     await LocalStorageService.instance.saveMessage(
       id:        msg.tempId ?? _uuid.v4(),
       chatId:    msg.chatId,
       senderId:  msg.senderId,
-      content:   msg.encryptedContent, // TODO: decrypt Step 8
+      content:   msg.encryptedContent,
       mediaType: msg.mediaType,
       sentAt:    msg.sentAt,
       status:    'delivered',
@@ -119,11 +161,20 @@ class _ChatScreenState extends State<ChatScreen> {
     await LocalStorageService.instance.updateLastMessage(
         msg.chatId, msg.encryptedContent, msg.sentAt);
 
-    // read receipt только для direct
+    if (!_senderNames.containsKey(msg.senderId)) {
+      final c = await LocalStorageService.instance.getContact(msg.senderId);
+      if (c != null && mounted) {
+        setState(() => _senderNames[msg.senderId] = c.displayName);
+      }
+    }
+    if (!_memberIds.contains(msg.senderId)) {
+      if (mounted) setState(() => _memberIds.add(msg.senderId));
+    }
+
     if (_chat?.type == 'direct') {
       WebSocketService.instance.sendRead(
-        chatId:    widget.chatId,
-        senderId:  msg.senderId,
+        chatId:     widget.chatId,
+        senderId:   msg.senderId,
         upToTempId: msg.tempId,
       );
     }
@@ -132,7 +183,17 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _send() async {
     final text = _textCtrl.text.trim();
-    if (text.isEmpty || _sending || _memberIds.isEmpty) return;
+    if (text.isEmpty || _sending) return;
+
+    if (_memberIds.isEmpty) {
+      await _fetchMembersFromServer();
+      if (_memberIds.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Не удалось загрузить участников')),
+        );
+        return;
+      }
+    }
 
     setState(() => _sending = true);
     _textCtrl.clear();
@@ -155,23 +216,17 @@ class _ChatScreenState extends State<ChatScreen> {
 
     _scrollToBottom();
 
-    // TODO (Шаг 8): зашифровать text
     final sent = WebSocketService.instance.sendMessage(
       chatId:           widget.chatId,
       tempId:           tempId,
       encryptedContent: text,
-      recipientIds:     _memberIds, // для групп — все участники
+      recipientIds:     _memberIds,
     );
 
-    if (!sent) debugPrint('[Chat] WS offline — message queued locally');
-
-    late StreamSubscription ackSub;
-    ackSub = WebSocketService.instance.onAck.listen((ack) async {
-      if (ack.tempId != tempId) return;
-      await LocalStorageService.instance.updateMessageStatus(
-          tempId, ack.delivered ? 'delivered' : 'sent');
-      ackSub.cancel();
-    });
+    if (!sent) {
+      await LocalStorageService.instance.updateMessageStatus(tempId, 'sending');
+      debugPrint('[Chat] WS offline — message stored locally');
+    }
 
     if (mounted) setState(() => _sending = false);
   }
@@ -207,6 +262,43 @@ class _ChatScreenState extends State<ChatScreen> {
         );
       }
     });
+  }
+
+  Future<void> _deleteChat() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Удалить чат?'),
+        content: const Text(
+            'Все сообщения будут удалены с этого устройства. '
+            'Собеседник не потеряет свои сообщения.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          TextButton(
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    // FIX: запоминаем удаление перед удалением из БД
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getStringList(_deletedChatsKey) ?? [];
+    if (!raw.contains(widget.chatId.toString())) {
+      raw.add(widget.chatId.toString());
+      await prefs.setStringList(_deletedChatsKey, raw);
+    }
+
+    await ChatService.deleteChat(widget.chatId);
+    await LocalStorageService.instance.deleteChatFull(widget.chatId);
+
+    if (mounted) context.go('/chats');
   }
 
   @override
@@ -245,6 +337,17 @@ class _ChatScreenState extends State<ChatScreen> {
     final avatarUrl = isGroup ? _chat?.avatarUrl : _peerContact?.avatarUrl;
 
     return AppBar(
+      // FIX: явная кнопка назад — никогда не пропадёт
+      leading: IconButton(
+        icon: const Icon(Icons.arrow_back),
+        onPressed: () {
+          if (context.canPop()) {
+            context.pop();
+          } else {
+            context.go('/chats');
+          }
+        },
+      ),
       titleSpacing: 0,
       title: GestureDetector(
         onTap: isGroup
@@ -252,8 +355,7 @@ class _ChatScreenState extends State<ChatScreen> {
             : null,
         child: Row(
           children: [
-            _AppBarAvatar(
-                name: name, url: avatarUrl, isGroup: isGroup),
+            _AppBarAvatar(name: name, url: avatarUrl, isGroup: isGroup),
             const SizedBox(width: 10),
             Expanded(
               child: Column(
@@ -263,7 +365,8 @@ class _ChatScreenState extends State<ChatScreen> {
                       style: const TextStyle(
                           fontSize: 16, fontWeight: FontWeight.bold)),
                   if (!isGroup && _peerId != null)
-                    OnlineStatusText(userId: _peerId!,
+                    OnlineStatusText(
+                        userId: _peerId!,
                         style: const TextStyle(fontSize: 12))
                   else if (isGroup)
                     Text('${_memberIds.length + 1} участников',
@@ -281,11 +384,29 @@ class _ChatScreenState extends State<ChatScreen> {
             icon: const Icon(Icons.info_outline),
             onPressed: () => context.push('/group-info/${widget.chatId}'),
           ),
+        PopupMenuButton<String>(
+          onSelected: (v) {
+            if (v == 'delete') _deleteChat();
+          },
+          itemBuilder: (_) => [
+            const PopupMenuItem(
+              value: 'delete',
+              child: Row(children: [
+                Icon(Icons.delete_outline, color: Colors.red),
+                SizedBox(width: 8),
+                Text('Удалить чат', style: TextStyle(color: Colors.red)),
+              ]),
+            ),
+          ],
+        ),
       ],
     );
   }
 
   Widget _buildMessages() {
+    if (_loadingMembers) {
+      return const Center(child: CircularProgressIndicator());
+    }
     return StreamBuilder<List<Message>>(
       stream: LocalStorageService.instance.watchMessages(widget.chatId),
       builder: (context, snap) {
@@ -308,7 +429,6 @@ class _ChatScreenState extends State<ChatScreen> {
             final showDate = i == 0 ||
                 !_sameDay(DateTime.parse(msgs[i - 1].sentAt),
                     DateTime.parse(msg.sentAt));
-            // Показываем имя отправителя в группах
             final showSender = _chat?.type == 'group' && !msg.isMe;
             return Column(
               children: [
@@ -329,13 +449,16 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Widget _buildTypingIndicator() {
-    final name = _chat?.type == 'group' ? 'Участник' : (_peerContact?.displayName ?? '');
+    final name = _chat?.type == 'group'
+        ? 'Участник'
+        : (_peerContact?.displayName ?? '');
     return Padding(
       padding: const EdgeInsets.only(left: 16, bottom: 4),
       child: Row(children: [
         Text(name, style: const TextStyle(fontSize: 12, color: Colors.grey)),
         const SizedBox(width: 4),
-        const Text('печатает...', style: TextStyle(fontSize: 12, color: Colors.grey)),
+        const Text('печатает...',
+            style: TextStyle(fontSize: 12, color: Colors.grey)),
         const SizedBox(width: 6),
         const _TypingDots(),
       ]),
@@ -353,15 +476,16 @@ class _ChatScreenState extends State<ChatScreen> {
               child: Container(
                 decoration: BoxDecoration(
                   color: isDark
-                      ? const Color(0xFF252525) : const Color(0xFFF0F0F0),
+                      ? const Color(0xFF252525)
+                      : const Color(0xFFF0F0F0),
                   borderRadius: BorderRadius.circular(24),
                 ),
                 child: TextField(
-                  controller:       _textCtrl,
-                  onChanged:        _onTextChanged,
-                  onSubmitted:      (_) => _send(),
-                  maxLines:         null,
-                  textInputAction:  TextInputAction.send,
+                  controller:      _textCtrl,
+                  onChanged:       _onTextChanged,
+                  onSubmitted:     (_) => _send(),
+                  maxLines:        null,
+                  textInputAction: TextInputAction.send,
                   decoration: const InputDecoration(
                     hintText: 'Сообщение...',
                     border: InputBorder.none,
@@ -377,7 +501,8 @@ class _ChatScreenState extends State<ChatScreen> {
               elevation: 1,
               child: _sending
                   ? const SizedBox(
-                      width: 18, height: 18,
+                      width: 18,
+                      height: 18,
                       child: CircularProgressIndicator(
                           strokeWidth: 2, color: Colors.white))
                   : const Icon(Icons.send_rounded),
@@ -398,7 +523,8 @@ class _AppBarAvatar extends StatelessWidget {
   final String name;
   final String? url;
   final bool isGroup;
-  const _AppBarAvatar({required this.name, this.url, required this.isGroup});
+  const _AppBarAvatar(
+      {required this.name, this.url, required this.isGroup});
 
   @override
   Widget build(BuildContext context) {
@@ -426,9 +552,13 @@ class _DateDivider extends StatelessWidget {
     final dt  = DateTime.parse(iso).toLocal();
     final now = DateTime.now();
     final String label;
-    if (now.difference(dt).inDays == 0)      label = 'Сегодня';
-    else if (now.difference(dt).inDays == 1) label = 'Вчера';
-    else label = '${dt.day}.${dt.month.toString().padLeft(2,'0')}.${dt.year}';
+    if (now.difference(dt).inDays == 0)
+      label = 'Сегодня';
+    else if (now.difference(dt).inDays == 1)
+      label = 'Вчера';
+    else
+      label =
+          '${dt.day}.${dt.month.toString().padLeft(2, '0')}.${dt.year}';
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 12),
@@ -465,20 +595,28 @@ class _TypingDotsState extends State<_TypingDots>
   }
 
   @override
-  void dispose() { _ctrl.dispose(); super.dispose(); }
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: _ctrl,
       builder: (_, __) => Row(
-        children: List.generate(3, (i) => Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 1),
-          child: Opacity(
-            opacity: (((_ctrl.value * 3 - i) % 3 + 3) % 3 < 1) ? 1.0 : 0.3,
-            child: const CircleAvatar(radius: 3, backgroundColor: Colors.grey),
+        children: List.generate(
+          3,
+          (i) => Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 1),
+            child: Opacity(
+              opacity:
+                  (((_ctrl.value * 3 - i) % 3 + 3) % 3 < 1) ? 1.0 : 0.3,
+              child: const CircleAvatar(
+                  radius: 3, backgroundColor: Colors.grey),
+            ),
           ),
-        )),
+        ),
       ),
     );
   }

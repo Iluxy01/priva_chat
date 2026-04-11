@@ -65,7 +65,12 @@ class AuthService {
     ).timeout(const Duration(seconds: 10));
 
     if (res.statusCode == 200) {
-      return UserModel.fromJson(jsonDecode(res.body));
+      final body = jsonDecode(res.body) as Map<String, dynamic>;
+      // Сервер возвращает { "user": {...} }
+      final userData = body.containsKey('user')
+          ? body['user'] as Map<String, dynamic>
+          : body;
+      return UserModel.fromJson(userData);
     }
     return null;
   }
@@ -82,7 +87,7 @@ class AuthService {
     if (displayName != null) body['display_name'] = displayName;
     if (status != null) body['status'] = status;
 
-    final res = await http.patch(
+    final res = await http.put(
       Uri.parse('$_base/users/me'),
       headers: {
         'Content-Type': 'application/json',
@@ -92,7 +97,11 @@ class AuthService {
     ).timeout(const Duration(seconds: 10));
 
     if (res.statusCode == 200) {
-      return {'success': true, 'user': UserModel.fromJson(jsonDecode(res.body))};
+      final respBody = jsonDecode(res.body) as Map<String, dynamic>;
+      final userData = respBody.containsKey('user')
+          ? respBody['user'] as Map<String, dynamic>
+          : respBody;
+      return {'success': true, 'user': UserModel.fromJson(userData)};
     }
     return {'success': false, 'error': 'Ошибка обновления'};
   }

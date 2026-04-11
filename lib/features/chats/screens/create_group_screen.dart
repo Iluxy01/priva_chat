@@ -108,6 +108,11 @@ class _CreateGroupScreenState extends State<CreateGroupScreen> {
       _showSnack('Добавь хотя бы одного участника');
       return;
     }
+    // Убедимся что myUserId загружен
+    if (_myUserId == 0) {
+      final prefs = await SharedPreferences.getInstance();
+      _myUserId = prefs.getInt(AppConstants.userIdKey) ?? 0;
+    }
 
     setState(() { _creating = true; _nameError = null; });
 
@@ -123,7 +128,10 @@ class _CreateGroupScreenState extends State<CreateGroupScreen> {
       // Сохранить чат и участников локально
       final storage = LocalStorageService.instance;
       await storage.saveChat(id: chatId, type: 'group', name: name);
-      await storage.saveMember(chatId, _myUserId, role: 'admin');
+      // Сохраняем себя как admin-участника
+      if (_myUserId != 0) {
+        await storage.saveMember(chatId, _myUserId, role: 'admin');
+      }
       for (final u in _selected) {
         await storage.saveContact(
           id: u.id, username: u.username, displayName: u.displayName,

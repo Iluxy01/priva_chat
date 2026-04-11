@@ -166,6 +166,14 @@ class AppDatabase extends _$AppDatabase {
 
   Future<void> deleteAllChatMessages(int chatId) =>
       (delete(messages)..where((t) => t.chatId.equals(chatId))).go();
+
+  // ── Delete Chat (cascade) ─────────────────────────────────────
+
+  Future<void> deleteChatFull(int chatId) async {
+    await (delete(messages)..where((t) => t.chatId.equals(chatId))).go();
+    await (delete(chatMembers)..where((t) => t.chatId.equals(chatId))).go();
+    await (delete(chats)..where((t) => t.id.equals(chatId))).go();
+  }
 }
 
 // ── Открытие БД ───────────────────────────────────────────────

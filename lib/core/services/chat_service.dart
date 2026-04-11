@@ -16,7 +16,6 @@ class ChatService {
     };
   }
 
-  // Сервер может вернуть {"users":[...]} или голый [...]
   static List<dynamic> _extractList(dynamic body, String key) {
     if (body is List) return body;
     if (body is Map)  return (body[key] as List<dynamic>?) ?? [];
@@ -90,8 +89,11 @@ class ChatService {
     debugPrint('[ChatService] createDirectChat → ${res.statusCode}: ${res.body}');
     if (res.statusCode == 200 || res.statusCode == 201) {
       final body = jsonDecode(res.body);
-      if (body is int)  return body;
-      if (body is Map)  return body['chat_id'] as int;
+      if (body is int) return body;
+      if (body is Map) {
+        final id = body['chat_id'] ?? body['id'];
+        if (id != null) return (id as num).toInt();
+      }
     }
     throw ChatException('Ошибка создания чата: ${res.statusCode}');
   }
@@ -120,7 +122,10 @@ class ChatService {
     if (res.statusCode == 200 || res.statusCode == 201) {
       final body = jsonDecode(res.body);
       if (body is int) return body;
-      if (body is Map) return body['chat_id'] as int;
+      if (body is Map) {
+        final id = body['chat_id'] ?? body['id'];
+        if (id != null) return (id as num).toInt();
+      }
     }
     throw ChatException('Ошибка создания группы: ${res.statusCode}');
   }
@@ -163,6 +168,20 @@ class ChatService {
     return _extractList(body, 'members')
         .map((u) => UserModel.fromJson(u as Map<String, dynamic>))
         .toList();
+  }
+
+  // ── Удалить чат ────────────────────────────────────────────────────────────
+
+  static Future<void> deleteChat(int chatId) async {
+    final headers = await _headers();
+    if (!headers.containsKey('Authorization')) return;
+    try {
+      await http.delete(
+        Uri.parse('$_base/chats/$chatId'),
+        headers: headers,
+      ).timeout(const Duration(seconds: 10));
+    } catch (_) {}
+    // Локальная очистка — на стороне вызывающего кода
   }
 }
 
