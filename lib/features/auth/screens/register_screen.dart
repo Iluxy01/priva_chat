@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import '../../../core/services/auth_service.dart';
-import '../../../core/services/crypto_service.dart';
 import '../../../core/theme/app_theme.dart';
 
 class RegisterScreen extends StatefulWidget {
@@ -15,9 +14,8 @@ class _RegisterScreenState extends State<RegisterScreen> {
   final _usernameCtrl    = TextEditingController();
   final _passwordCtrl    = TextEditingController();
   final _confirmCtrl     = TextEditingController();
-  bool _loading      = false;
-  bool _obscure      = true;
-  bool _generatingKey = false;
+  bool _loading = false;
+  bool _obscure = true;
   String? _error;
 
   @override
@@ -35,12 +33,14 @@ class _RegisterScreenState extends State<RegisterScreen> {
     final password    = _passwordCtrl.text;
     final confirm     = _confirmCtrl.text;
 
+    // Валидация
     if (displayName.isEmpty || username.isEmpty || password.isEmpty) {
       setState(() => _error = 'Заполни все поля');
       return;
     }
     if (!RegExp(r'^[a-z0-9_.]{3,32}$').hasMatch(username)) {
-      setState(() => _error = 'Username: 3–32 символа, только a-z, 0-9, _ или .');
+      setState(() => _error =
+          'Username: 3–32 символа, только a-z, 0-9, _ или .');
       return;
     }
     if (password.length < 6) {
@@ -55,27 +55,10 @@ class _RegisterScreenState extends State<RegisterScreen> {
     setState(() { _loading = true; _error = null; });
 
     try {
-      // Шаг 1: Генерация RSA-2048 ключей
-      setState(() => _generatingKey = true);
-      String publicKey;
-      try {
-        publicKey = await CryptoService.instance.generateAndStoreKeyPair();
-      } catch (e) {
-        setState(() {
-          _error = 'Ошибка генерации ключей шифрования';
-          _loading = false;
-          _generatingKey = false;
-        });
-        return;
-      }
-      setState(() => _generatingKey = false);
-
-      // Шаг 2: Регистрация на сервере с публичным ключом
       final result = await AuthService.register(
-        username:    username,
+        username: username,
         displayName: displayName,
-        password:    password,
-        publicKey:   publicKey,
+        password: password,
       );
 
       if (!mounted) return;
@@ -88,7 +71,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
     } catch (e) {
       setState(() => _error = 'Нет соединения с сервером');
     } finally {
-      if (mounted) setState(() { _loading = false; _generatingKey = false; });
+      if (mounted) setState(() => _loading = false);
     }
   }
 
@@ -104,32 +87,44 @@ class _RegisterScreenState extends State<RegisterScreen> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const SizedBox(height: 48),
+
+              // Заголовок
               Center(
                 child: Container(
-                  width: 72, height: 72,
+                  width: 72,
+                  height: 72,
                   decoration: BoxDecoration(
                     color: AppColors.primary,
                     borderRadius: BorderRadius.circular(22),
                   ),
-                  child: const Icon(Icons.person_add_outlined, color: Colors.white, size: 36),
+                  child: const Icon(Icons.person_add_outlined,
+                      color: Colors.white, size: 36),
                 ),
               ),
               const SizedBox(height: 20),
-              Text('Создать аккаунт',
+              Text(
+                'Создать аккаунт',
                 textAlign: TextAlign.center,
                 style: TextStyle(
-                  fontSize: 26, fontWeight: FontWeight.bold,
+                  fontSize: 26,
+                  fontWeight: FontWeight.bold,
                   color: dark ? AppColors.textDark : AppColors.textLight,
                 ),
               ),
               const SizedBox(height: 8),
-              Text('Твои данные в безопасности',
+              Text(
+                'Твои данные в безопасности',
                 textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 14,
-                  color: dark ? AppColors.textSecondaryDark : AppColors.textSecondaryLight),
+                style: TextStyle(
+                  fontSize: 14,
+                  color: dark
+                      ? AppColors.textSecondaryDark
+                      : AppColors.textSecondaryLight,
+                ),
               ),
               const SizedBox(height: 36),
 
+              // Поля
               TextField(
                 controller: _displayNameCtrl,
                 textInputAction: TextInputAction.next,
@@ -139,6 +134,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
                 ),
               ),
               const SizedBox(height: 12),
+
               TextField(
                 controller: _usernameCtrl,
                 autocorrect: false,
@@ -149,6 +145,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
                 ),
               ),
               const SizedBox(height: 12),
+
               TextField(
                 controller: _passwordCtrl,
                 obscureText: _obscure,
@@ -157,12 +154,14 @@ class _RegisterScreenState extends State<RegisterScreen> {
                   hintText: 'Пароль (мин. 6 символов)',
                   prefixIcon: const Icon(Icons.lock_outline),
                   suffixIcon: IconButton(
-                    icon: Icon(_obscure ? Icons.visibility_off : Icons.visibility),
+                    icon: Icon(
+                        _obscure ? Icons.visibility_off : Icons.visibility),
                     onPressed: () => setState(() => _obscure = !_obscure),
                   ),
                 ),
               ),
               const SizedBox(height: 12),
+
               TextField(
                 controller: _confirmCtrl,
                 obscureText: _obscure,
@@ -174,6 +173,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
                 ),
               ),
 
+              // Ошибка
               if (_error != null) ...[
                 const SizedBox(height: 12),
                 Container(
@@ -182,86 +182,53 @@ class _RegisterScreenState extends State<RegisterScreen> {
                     color: Colors.red.withOpacity(0.1),
                     borderRadius: BorderRadius.circular(12),
                   ),
-                  child: Text(_error!,
+                  child: Text(
+                    _error!,
                     style: const TextStyle(color: Colors.red, fontSize: 13),
-                    textAlign: TextAlign.center),
-                ),
-              ],
-
-              if (_generatingKey) ...[
-                const SizedBox(height: 16),
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF6C63FF).withOpacity(0.08),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const SizedBox(
-                        width: 16, height: 16,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 2, color: Color(0xFF6C63FF)),
-                      ),
-                      const SizedBox(width: 10),
-                      Text('Генерация ключей шифрования...',
-                        style: TextStyle(fontSize: 13,
-                          color: dark ? const Color(0xFFB0AAF8) : const Color(0xFF6C63FF)),
-                      ),
-                    ],
+                    textAlign: TextAlign.center,
                   ),
                 ),
               ],
 
               const SizedBox(height: 24),
+
               SizedBox(
                 height: 52,
                 child: ElevatedButton(
                   onPressed: _loading ? null : _register,
-                  child: _loading && !_generatingKey
+                  child: _loading
                       ? const SizedBox(
-                          width: 22, height: 22,
-                          child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5))
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(
+                              color: Colors.white, strokeWidth: 2.5),
+                        )
                       : const Text('Зарегистрироваться'),
                 ),
               ),
 
-              const SizedBox(height: 12),
-              Container(
-                padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
-                decoration: BoxDecoration(
-                  color: Colors.green.withOpacity(0.07),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Icon(Icons.lock, size: 14, color: Colors.green),
-                    const SizedBox(width: 6),
-                    Flexible(
-                      child: Text(
-                        'RSA + AES ключи генерируются прямо на устройстве',
-                        style: TextStyle(fontSize: 11,
-                          color: dark ? Colors.green[300] : Colors.green[700]),
-                        textAlign: TextAlign.center,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-
               const SizedBox(height: 16),
+
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Text('Уже есть аккаунт? ',
+                  Text(
+                    'Уже есть аккаунт? ',
                     style: TextStyle(
-                      color: dark ? AppColors.textSecondaryDark : AppColors.textSecondaryLight)),
+                      color: dark
+                          ? AppColors.textSecondaryDark
+                          : AppColors.textSecondaryLight,
+                    ),
+                  ),
                   GestureDetector(
                     onTap: () => context.go('/login'),
-                    child: const Text('Войти',
-                      style: TextStyle(color: AppColors.primary, fontWeight: FontWeight.w600)),
+                    child: const Text(
+                      'Войти',
+                      style: TextStyle(
+                        color: AppColors.primary,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
                   ),
                 ],
               ),
