@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -6,12 +7,13 @@ import 'package:uuid/uuid.dart';
 import '../../../core/constants/app_constants.dart';
 import '../../../core/database/app_database.dart';
 import '../../../core/services/chat_service.dart';
+import '../../../core/services/crypto_service.dart';
 import '../../../core/services/local_storage_service.dart';
+import '../../../core/services/secure_storage_service.dart';
 import '../../../core/services/websocket_service.dart';
 import '../../../core/widgets/connection_status_bar.dart';
 import '../widgets/message_bubble.dart';
 
-// Ключ для хранения удалённых чатов (должен совпадать с ChatsListScreen)
 const _deletedChatsKey = 'deleted_chat_ids';
 
 class ChatScreen extends StatefulWidget {
@@ -29,20 +31,22 @@ class _ChatScreenState extends State<ChatScreen> {
 
   int    _myUserId = 0;
   Chat?  _chat;
-
-  int?     _peerId;
+  int?   _peerId;
   Contact? _peerContact;
 
   List<int> _memberIds = [];
 
-  bool _isTyping = false;
+  bool _isTyping   = false;
   Timer? _typingTimer;
   Timer? _myTypingTimer;
-  bool _sending = false;
+  bool _sending    = false;
   bool _loadingMembers = true;
 
   final List<StreamSubscription> _subs = [];
   final Map<int, String> _senderNames = {};
+
+  // E2E: кэш публичных ключей участников
+  final Map<int, String> _publicKeys = {};
 
   @override
   void initState() {
@@ -59,13 +63,17 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_chat?.type == 'direct' && _chat?.peerId != null) {
       _peerId = _chat!.peerId;
       _peerContact = await LocalStorageService.instance.getContact(_peerId!);
+      if (_peerContact?.publicKey != null && _peerContact!.publicKey!.isNotEmpty) {
+        _publicKeys[_peerId!] = _peerContact!.publicKey!;
+      }
     }
 
+    // Загружаем участников из локальной БД
     await _loadMembers();
 
-    if (_memberIds.isEmpty) {
-      await _fetchMembersFromServer();
-    }
+    // Всегда получаем свежие ключи с сервера — public_key мог
+    // отсутствовать в локальном кэше (старая запись до Task 8)
+    await _fetchMembersFromServer();
 
     if (mounted) setState(() => _loadingMembers = false);
     await LocalStorageService.instance.clearUnread(widget.chatId);
@@ -74,15 +82,17 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _loadMembers() async {
     final members = await LocalStorageService.instance.getChatMembers(widget.chatId);
-    _memberIds = members
-        .map((m) => m.userId)
-        .where((id) => id != _myUserId)
-        .toList();
+    _memberIds = members.map((m) => m.userId).where((id) => id != _myUserId).toList();
 
     for (final m in members) {
       if (m.userId == _myUserId) continue;
       final c = await LocalStorageService.instance.getContact(m.userId);
-      if (c != null) _senderNames[m.userId] = c.displayName;
+      if (c != null) {
+        _senderNames[m.userId] = c.displayName;
+        if (c.publicKey != null && c.publicKey!.isNotEmpty) {
+          _publicKeys[m.userId] = c.publicKey!;
+        }
+      }
     }
   }
 
@@ -90,22 +100,29 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       final serverMembers = await ChatService.getChatMembers(widget.chatId);
       for (final u in serverMembers) {
+        // Сохраняем / обновляем контакт в локальной БД (включая public_key)
         await LocalStorageService.instance.saveContact(
-          id: u.id,
-          username: u.username,
-          displayName: u.displayName,
-          avatarUrl: u.avatarUrl,
-          publicKey: u.publicKey,
-          lastSeen: u.lastSeen,
+          id: u.id, username: u.username,
+          displayName: u.displayName, avatarUrl: u.avatarUrl,
+          publicKey: u.publicKey, lastSeen: u.lastSeen,
         );
         await LocalStorageService.instance.saveMember(widget.chatId, u.id);
+
         if (u.id != _myUserId) {
           _senderNames[u.id] = u.displayName;
+          // Обновляем ключ — это главная цель вызова
+          if (u.publicKey != null && u.publicKey!.isNotEmpty) {
+            _publicKeys[u.id] = u.publicKey!;
+            debugPrint('[E2E] Loaded public key for user \${u.id} (\${u.username})');
+          } else {
+            debugPrint('[E2E] ⚠️ No public key for user \${u.id} (\${u.username}) — not yet on Task8');
+          }
         }
       }
       await _loadMembers();
+      if (mounted) setState(() {});
     } catch (e) {
-      debugPrint('[ChatScreen] fetchMembers error: $e');
+      debugPrint('[ChatScreen] fetchMembers error: \$e');
     }
   }
 
@@ -114,10 +131,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
     _subs.add(ws.onMessage.listen((msg) {
       if (msg.chatId != widget.chatId) return;
-      // FIX: ChatsListScreen уже сохраняет сообщение глобально.
-      // Здесь нам нужно только обновить UI (сenderNames, scroll, read receipt).
-      // Но на случай если ChatsListScreen ещё не успел — дёргаем saveMessage тоже
-      // (insertOnConflictUpdate — дублей не будет).
       _handleIncoming(msg);
     }));
 
@@ -128,8 +141,9 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() => _isTyping = t.isTyping);
       if (t.isTyping) {
         _typingTimer = Timer(
-            const Duration(seconds: 3),
-            () { if (mounted) setState(() => _isTyping = false); });
+          const Duration(seconds: 3),
+          () { if (mounted) setState(() => _isTyping = false); },
+        );
       }
     }));
 
@@ -146,25 +160,47 @@ class _ChatScreenState extends State<ChatScreen> {
     }));
   }
 
+  // ── Дешифрование входящего сообщения ────────────────────────────────────
+
+  Future<String> _decryptIncoming(WsMessage msg) async {
+    // Если нет IV или encryptedKey — сообщение не зашифровано (legacy / fallback)
+    if (msg.iv == null || msg.encryptedKey == null) {
+      return msg.encryptedContent;
+    }
+    try {
+      return await CryptoService.instance.decryptMessage2(
+        encryptedContent: msg.encryptedContent,
+        iv:               msg.iv!,
+        rawEncryptedKey:  msg.encryptedKey!,
+        myUserId:         _myUserId,
+      );
+    } catch (e) {
+      debugPrint('[ChatScreen] Decrypt error: $e');
+      return '[🔒 Не удалось расшифровать]';
+    }
+  }
+
   Future<void> _handleIncoming(WsMessage msg) async {
-    // Сохраняем — insertOnConflictUpdate, дублей нет даже если ChatsListScreen уже сохранил
+    final plaintext = await _decryptIncoming(msg);
+
     await LocalStorageService.instance.saveMessage(
       id:        msg.tempId ?? _uuid.v4(),
       chatId:    msg.chatId,
       senderId:  msg.senderId,
-      content:   msg.encryptedContent,
+      content:   plaintext,    // Сохраняем расшифрованное
       mediaType: msg.mediaType,
       sentAt:    msg.sentAt,
       status:    'delivered',
       isMe:      false,
     );
     await LocalStorageService.instance.updateLastMessage(
-        msg.chatId, msg.encryptedContent, msg.sentAt);
+        msg.chatId, plaintext, msg.sentAt);
 
     if (!_senderNames.containsKey(msg.senderId)) {
       final c = await LocalStorageService.instance.getContact(msg.senderId);
       if (c != null && mounted) {
         setState(() => _senderNames[msg.senderId] = c.displayName);
+        if (c.publicKey != null) _publicKeys[msg.senderId] = c.publicKey!;
       }
     }
     if (!_memberIds.contains(msg.senderId)) {
@@ -180,6 +216,8 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     _scrollToBottom();
   }
+
+  // ── Шифрование и отправка ─────────────────────────────────────────────────
 
   Future<void> _send() async {
     final text = _textCtrl.text.trim();
@@ -202,6 +240,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final tempId = _uuid.v4();
     final sentAt = DateTime.now().toUtc().toIso8601String();
 
+    // Сохраняем plaintext локально сразу
     await LocalStorageService.instance.saveMessage(
       id:       tempId,
       chatId:   widget.chatId,
@@ -211,21 +250,56 @@ class _ChatScreenState extends State<ChatScreen> {
       status:   'sending',
       isMe:     true,
     );
-    await LocalStorageService.instance.updateLastMessage(
-        widget.chatId, text, sentAt);
-
+    await LocalStorageService.instance.updateLastMessage(widget.chatId, text, sentAt);
     _scrollToBottom();
+
+    // Шифруем для каждого получателя
+    String encryptedContent = text;
+    String? iv;
+    Map<int, String> encryptedKeys = {};
+    bool encryptionOk = false;
+
+    try {
+      if (_chat?.type == 'direct' && _peerId != null) {
+        final peerPubKey = _publicKeys[_peerId!];
+        if (peerPubKey != null && peerPubKey.isNotEmpty) {
+          final payload = CryptoService.instance.encryptForRecipient(text, peerPubKey);
+          encryptedContent = payload.encryptedContent;
+          iv               = payload.iv;
+          encryptedKeys[_peerId!] = payload.encryptedKey;
+          encryptionOk = true;
+        }
+      } else if (_chat?.type == 'group') {
+        // Группа: шифруем для всех у кого есть публичный ключ
+        final keysAvailable = Map<int, String>.from(_publicKeys)
+          ..remove(_myUserId);
+        if (keysAvailable.isNotEmpty) {
+          final payload = CryptoService.instance.encryptForGroup(text, keysAvailable);
+          encryptedContent = payload.encryptedContent;
+          iv               = payload.iv;
+          encryptedKeys    = payload.encryptedKeys;
+          encryptionOk = true;
+        }
+      }
+    } catch (e) {
+      debugPrint('[ChatScreen] Encrypt error: $e — sending plaintext');
+    }
+
+    if (!encryptionOk) {
+      debugPrint('[ChatScreen] No public key — sending without encryption');
+    }
 
     final sent = WebSocketService.instance.sendMessage(
       chatId:           widget.chatId,
       tempId:           tempId,
-      encryptedContent: text,
+      encryptedContent: encryptedContent,
       recipientIds:     _memberIds,
+      iv:               iv,
+      encryptedKeys:    encryptedKeys,
     );
 
     if (!sent) {
       await LocalStorageService.instance.updateMessageStatus(tempId, 'sending');
-      debugPrint('[Chat] WS offline — message stored locally');
     }
 
     if (mounted) setState(() => _sending = false);
@@ -235,10 +309,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_memberIds.isEmpty) return;
     _myTypingTimer?.cancel();
     WebSocketService.instance.sendTyping(
-      chatId:       widget.chatId,
-      recipientIds: _memberIds,
-      isTyping:     true,
-    );
+      chatId: widget.chatId, recipientIds: _memberIds, isTyping: true);
     _myTypingTimer = Timer(const Duration(seconds: 2), _stopMyTyping);
   }
 
@@ -246,10 +317,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _myTypingTimer?.cancel();
     if (_memberIds.isEmpty) return;
     WebSocketService.instance.sendTyping(
-      chatId:       widget.chatId,
-      recipientIds: _memberIds,
-      isTyping:     false,
-    );
+      chatId: widget.chatId, recipientIds: _memberIds, isTyping: false);
   }
 
   void _scrollToBottom() {
@@ -264,6 +332,14 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  Future<void> _openVerification() async {
+    if (_peerContact == null) return;
+    context.push('/verify/${_peerId}', extra: {
+      'peerName':      _peerContact!.displayName,
+      'peerPublicKey': _peerContact!.publicKey,
+    });
+  }
+
   Future<void> _deleteChat() async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -273,10 +349,7 @@ class _ChatScreenState extends State<ChatScreen> {
             'Все сообщения будут удалены с этого устройства. '
             'Собеседник не потеряет свои сообщения.'),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Отмена'),
-          ),
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Отмена')),
           TextButton(
             style: TextButton.styleFrom(foregroundColor: Colors.red),
             onPressed: () => Navigator.pop(context, true),
@@ -287,7 +360,6 @@ class _ChatScreenState extends State<ChatScreen> {
     );
     if (confirmed != true || !mounted) return;
 
-    // FIX: запоминаем удаление перед удалением из БД
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getStringList(_deletedChatsKey) ?? [];
     if (!raw.contains(widget.chatId.toString())) {
@@ -297,7 +369,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
     await ChatService.deleteChat(widget.chatId);
     await LocalStorageService.instance.deleteChatFull(widget.chatId);
-
     if (mounted) context.go('/chats');
   }
 
@@ -312,7 +383,7 @@ class _ChatScreenState extends State<ChatScreen> {
     super.dispose();
   }
 
-  // ── Build ──────────────────────────────────────────────────────────────────
+  // ── Build ─────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -331,28 +402,24 @@ class _ChatScreenState extends State<ChatScreen> {
 
   PreferredSizeWidget _buildAppBar() {
     final isGroup = _chat?.type == 'group';
-    final name = isGroup
-        ? (_chat?.name ?? 'Группа')
-        : (_peerContact?.displayName ?? 'Пользователь');
+    final name    = isGroup ? (_chat?.name ?? 'Группа')
+                            : (_peerContact?.displayName ?? 'Пользователь');
     final avatarUrl = isGroup ? _chat?.avatarUrl : _peerContact?.avatarUrl;
 
+    // Проверяем верификацию
+    final bool hasKey = !isGroup && (_peerContact?.publicKey?.isNotEmpty ?? false);
+
     return AppBar(
-      // FIX: явная кнопка назад — никогда не пропадёт
       leading: IconButton(
         icon: const Icon(Icons.arrow_back),
         onPressed: () {
-          if (context.canPop()) {
-            context.pop();
-          } else {
-            context.go('/chats');
-          }
+          if (context.canPop()) context.pop();
+          else context.go('/chats');
         },
       ),
       titleSpacing: 0,
       title: GestureDetector(
-        onTap: isGroup
-            ? () => context.push('/group-info/${widget.chatId}')
-            : null,
+        onTap: isGroup ? () => context.push('/group-info/${widget.chatId}') : null,
         child: Row(
           children: [
             _AppBarAvatar(name: name, url: avatarUrl, isGroup: isGroup),
@@ -361,17 +428,12 @@ class _ChatScreenState extends State<ChatScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(name,
-                      style: const TextStyle(
-                          fontSize: 16, fontWeight: FontWeight.bold)),
+                  Text(name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
                   if (!isGroup && _peerId != null)
-                    OnlineStatusText(
-                        userId: _peerId!,
-                        style: const TextStyle(fontSize: 12))
+                    OnlineStatusText(userId: _peerId!, style: const TextStyle(fontSize: 12))
                   else if (isGroup)
                     Text('${_memberIds.length + 1} участников',
-                        style: const TextStyle(
-                            fontSize: 12, color: Colors.grey)),
+                      style: const TextStyle(fontSize: 12, color: Colors.grey)),
                 ],
               ),
             ),
@@ -379,15 +441,20 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       ),
       actions: [
+        // Иконка замка / верификации
+        if (hasKey)
+          IconButton(
+            icon: const Icon(Icons.verified_user_outlined),
+            tooltip: 'Верификация устройства',
+            onPressed: _openVerification,
+          ),
         if (isGroup)
           IconButton(
             icon: const Icon(Icons.info_outline),
             onPressed: () => context.push('/group-info/${widget.chatId}'),
           ),
         PopupMenuButton<String>(
-          onSelected: (v) {
-            if (v == 'delete') _deleteChat();
-          },
+          onSelected: (v) { if (v == 'delete') _deleteChat(); },
           itemBuilder: (_) => [
             const PopupMenuItem(
               value: 'delete',
@@ -412,14 +479,28 @@ class _ChatScreenState extends State<ChatScreen> {
       builder: (context, snap) {
         final msgs = snap.data ?? [];
         if (msgs.isEmpty) {
-          return const Center(
-            child: Text('Напиши первое сообщение 👋',
-                style: TextStyle(color: Colors.grey)),
+          return Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text('Напиши первое сообщение 👋',
+                    style: TextStyle(color: Colors.grey)),
+                const SizedBox(height: 8),
+                if (_chat?.type == 'direct' && _peerContact?.publicKey != null)
+                  const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.lock, size: 14, color: Colors.green),
+                      SizedBox(width: 4),
+                      Text('E2E шифрование активно',
+                          style: TextStyle(fontSize: 12, color: Colors.green)),
+                    ],
+                  ),
+              ],
+            ),
           );
         }
-        WidgetsBinding.instance
-            .addPostFrameCallback((_) => _scrollToBottom());
-
+        WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
         return ListView.builder(
           controller: _scrollCtrl,
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -427,8 +508,7 @@ class _ChatScreenState extends State<ChatScreen> {
           itemBuilder: (context, i) {
             final msg = msgs[i];
             final showDate = i == 0 ||
-                !_sameDay(DateTime.parse(msgs[i - 1].sentAt),
-                    DateTime.parse(msg.sentAt));
+                !_sameDay(DateTime.parse(msgs[i - 1].sentAt), DateTime.parse(msg.sentAt));
             final showSender = _chat?.type == 'group' && !msg.isMe;
             return Column(
               children: [
@@ -436,9 +516,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 MessageBubble(
                   message:    msg,
                   myUserId:   _myUserId,
-                  senderName: showSender
-                      ? (_senderNames[msg.senderId] ?? 'Участник')
-                      : null,
+                  senderName: showSender ? (_senderNames[msg.senderId] ?? 'Участник') : null,
                 ),
               ],
             );
@@ -449,16 +527,13 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Widget _buildTypingIndicator() {
-    final name = _chat?.type == 'group'
-        ? 'Участник'
-        : (_peerContact?.displayName ?? '');
+    final name = _chat?.type == 'group' ? 'Участник' : (_peerContact?.displayName ?? '');
     return Padding(
       padding: const EdgeInsets.only(left: 16, bottom: 4),
       child: Row(children: [
         Text(name, style: const TextStyle(fontSize: 12, color: Colors.grey)),
         const SizedBox(width: 4),
-        const Text('печатает...',
-            style: TextStyle(fontSize: 12, color: Colors.grey)),
+        const Text('печатает...', style: TextStyle(fontSize: 12, color: Colors.grey)),
         const SizedBox(width: 6),
         const _TypingDots(),
       ]),
@@ -475,9 +550,7 @@ class _ChatScreenState extends State<ChatScreen> {
             Expanded(
               child: Container(
                 decoration: BoxDecoration(
-                  color: isDark
-                      ? const Color(0xFF252525)
-                      : const Color(0xFFF0F0F0),
+                  color: isDark ? const Color(0xFF252525) : const Color(0xFFF0F0F0),
                   borderRadius: BorderRadius.circular(24),
                 ),
                 child: TextField(
@@ -489,8 +562,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   decoration: const InputDecoration(
                     hintText: 'Сообщение...',
                     border: InputBorder.none,
-                    contentPadding:
-                        EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                    contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                   ),
                 ),
               ),
@@ -501,10 +573,8 @@ class _ChatScreenState extends State<ChatScreen> {
               elevation: 1,
               child: _sending
                   ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(
-                          strokeWidth: 2, color: Colors.white))
+                      width: 18, height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
                   : const Icon(Icons.send_rounded),
             ),
           ],
@@ -523,8 +593,7 @@ class _AppBarAvatar extends StatelessWidget {
   final String name;
   final String? url;
   final bool isGroup;
-  const _AppBarAvatar(
-      {required this.name, this.url, required this.isGroup});
+  const _AppBarAvatar({required this.name, this.url, required this.isGroup});
 
   @override
   Widget build(BuildContext context) {
@@ -536,8 +605,7 @@ class _AppBarAvatar extends StatelessWidget {
           ? (isGroup
               ? const Icon(Icons.group, color: Colors.white, size: 18)
               : Text(name.isNotEmpty ? name[0].toUpperCase() : '?',
-                  style: const TextStyle(
-                      color: Colors.white, fontWeight: FontWeight.bold)))
+                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)))
           : null,
     );
   }
@@ -557,8 +625,7 @@ class _DateDivider extends StatelessWidget {
     else if (now.difference(dt).inDays == 1)
       label = 'Вчера';
     else
-      label =
-          '${dt.day}.${dt.month.toString().padLeft(2, '0')}.${dt.year}';
+      label = '${dt.day}.${dt.month.toString().padLeft(2, '0')}.${dt.year}';
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 12),
@@ -566,8 +633,7 @@ class _DateDivider extends StatelessWidget {
         const Expanded(child: Divider()),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12),
-          child: Text(label,
-              style: const TextStyle(fontSize: 12, color: Colors.grey)),
+          child: Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
         ),
         const Expanded(child: Divider()),
       ]),
@@ -589,34 +655,24 @@ class _TypingDotsState extends State<_TypingDots>
   void initState() {
     super.initState();
     _ctrl = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 900),
-    )..repeat();
+      vsync: this, duration: const Duration(milliseconds: 900))..repeat();
   }
 
   @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
+  void dispose() { _ctrl.dispose(); super.dispose(); }
 
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: _ctrl,
       builder: (_, __) => Row(
-        children: List.generate(
-          3,
-          (i) => Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 1),
-            child: Opacity(
-              opacity:
-                  (((_ctrl.value * 3 - i) % 3 + 3) % 3 < 1) ? 1.0 : 0.3,
-              child: const CircleAvatar(
-                  radius: 3, backgroundColor: Colors.grey),
-            ),
+        children: List.generate(3, (i) => Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 1),
+          child: Opacity(
+            opacity: (((_ctrl.value * 3 - i) % 3 + 3) % 3 < 1) ? 1.0 : 0.3,
+            child: const CircleAvatar(radius: 3, backgroundColor: Colors.grey),
           ),
-        ),
+        )),
       ),
     );
   }

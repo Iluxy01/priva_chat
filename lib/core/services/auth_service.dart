@@ -12,6 +12,7 @@ class AuthService {
     required String username,
     required String displayName,
     required String password,
+    String? publicKey,
   }) async {
     final res = await http
         .post(
@@ -21,6 +22,7 @@ class AuthService {
             'username': username,
             'display_name': displayName,
             'password': password,
+            if (publicKey != null) 'public_key': publicKey,
           }),
         )
         .timeout(const Duration(seconds: 15));
